@@ -111,9 +111,9 @@ export function RepoDetail() {
             }
           >
             {repo.ingestion_status === "importing"
-              ? (repo.source_type === "gitlab" ? "verifying access…" : "importing…")
+              ? (repo.source_type !== "upload" ? "verifying access…" : "importing…")
               : repo.ingestion_status === "ready"
-                ? (repo.source_type === "gitlab" ? "access verified" : "ready")
+                ? (repo.source_type !== "upload" ? "access verified" : "ready")
                 : `failed — ${repo.ingestion_error ?? "unknown error"}`}
           </span>
         </p>
@@ -248,7 +248,7 @@ export function RepoDetail() {
             <FileTree paths={tree.paths} />
           ) : (
             <div className="py-6 text-center text-sm text-slate">
-              {repo.source_type === "gitlab"
+              {repo.source_type !== "upload"
                 ? "File structure becomes available after the first scan clones the repository."
                 : "No files captured yet."}
             </div>

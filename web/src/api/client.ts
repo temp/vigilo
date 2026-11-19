@@ -90,7 +90,7 @@ export interface Job {
 }
 export interface Credential {
   id: string;
-  kind: "gitlab_token" | "cookie_header" | string;
+  kind: "gitlab_token" | "github_token" | "github_app" | "cookie_header" | string;
   label: string;
   gitlab_base_url: string | null;
   created_at: string;
@@ -217,7 +217,9 @@ export const api = {
   },
   me: () => request<User>("/users/me"),
   repositories: () => request<Repository[]>("/repositories"),
-  createRepository: (body: Partial<Repository> & { gitlab_token?: string; push_patches?: boolean }) =>
+  createRepository: (
+    body: Partial<Repository> & { gitlab_token?: string; github_token?: string; push_patches?: boolean },
+  ) =>
     request<Repository>("/repositories", { method: "POST", body: JSON.stringify(body) }),
   deleteRepository: (id: string) =>
     request<void>(`/repositories/${id}`, { method: "DELETE" }),

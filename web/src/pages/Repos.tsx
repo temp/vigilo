@@ -204,11 +204,12 @@ function AddRepoModal({ onClose, onCreated }: { onClose: () => void; onCreated: 
       const repo = await api.createRepository({
         name,
         source_type: sourceType,
-        gitlab_url: sourceType === "gitlab" ? gitlabUrl : null,
+        gitlab_url: sourceType === "gitlab" || sourceType === "github" ? gitlabUrl : null,
         is_private: isPrivate,
         ...(sourceType === "gitlab"
           ? { gitlab_token: gitlabToken || undefined, push_patches: pushPatches }
           : {}),
+        ...(sourceType === "github" ? { github_token: gitlabToken || undefined } : {}),
       });
       // Upload returns immediately; ingestion runs in the background (repo shows
       // "importing" → ready/failed on the card), so this never blocks the UI.
@@ -245,6 +246,7 @@ function AddRepoModal({ onClose, onCreated }: { onClose: () => void; onCreated: 
             <select id="repo-source" className="field" value={sourceType} onChange={(e) => setSourceType(e.target.value)}>
               <option value="upload">Upload</option>
               <option value="gitlab">GitLab</option>
+              <option value="github">GitHub / GitHub Enterprise</option>
             </select>
           </div>
           {sourceType === "gitlab" && (
@@ -281,6 +283,42 @@ function AddRepoModal({ onClose, onCreated }: { onClose: () => void; onCreated: 
                 <input type="checkbox" checked={pushPatches} onChange={(e) => setPushPatches(e.target.checked)} />
                 Push fix branches / MRs back to GitLab (uses the deployment's GitLab token)
               </label>
+            </>
+          )}
+          {sourceType === "github" && (
+            <>
+              <div>
+                <label htmlFor="repo-github-url" className="mb-1 block text-sm text-slate">GitHub repository URL</label>
+                <input
+                  id="repo-github-url"
+                  className="field"
+                  value={gitlabUrl}
+                  onChange={(e) => setGitlabUrl(e.target.value)}
+                  placeholder="https://github.example.com/org/repo"
+                />
+                <p className="mt-1 text-xs text-slate">
+                  github.com or a GitHub Enterprise Server host (https only).
+                </p>
+              </div>
+              <div>
+                <label htmlFor="repo-github-token" className="mb-1 block text-sm text-slate">
+                  Personal access token
+                </label>
+                <input
+                  id="repo-github-token"
+                  className="field"
+                  type="password"
+                  value={gitlabToken}
+                  onChange={(e) => setGitlabToken(e.target.value)}
+                  placeholder="ghp_… / github_pat_…"
+                  autoComplete="off"
+                />
+                <p className="mt-1 text-xs text-slate">
+                  Used to <b>clone</b> this repository; read access to its contents is enough.
+                  Stored encrypted (never shown again); access is verified right after adding.
+                  Pushing fixes back to GitHub is not supported yet.
+                </p>
+              </div>
             </>
           )}
           {sourceType === "upload" && (

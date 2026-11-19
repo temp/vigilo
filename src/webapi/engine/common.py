@@ -98,6 +98,28 @@ async def resolve_job_cookie(job: Any) -> str | None:
     return build_vault(get_settings()).decrypt(cred.secret_enc)
 
 
+async def resolve_repo_token(credential_id, repo: Repository) -> str | None:
+    """The clone secret for the repository's source: the decrypted GitLab token, or a
+    freshly minted GitHub App installation token. Re-checks owner, kind and host
+    binding right before decrypting; a failing check aborts the run start."""
+    import asyncio
+
+    from src.webapi.credential_guard import CredentialRejected, validate_source_credential
+    from src.webapi.db import _session_maker
+    from src.webapi.models import Credential
+    from src.webapi.source_access import resolve_clone_token
+
+    async with _session_maker()() as session:
+        cred = await session.get(Credential, credential_id)
+        if cred is None:
+            return None
+        try:
+            validate_source_credential(cred, repo.created_by, repo.source_type, repo.gitlab_url)
+        except CredentialRejected as exc:
+            raise RuntimeError(f"Repository credential refused: {exc}") from exc
+    return await asyncio.to_thread(resolve_clone_token, cred, repo.source_type, repo.gitlab_url)
+
+
 async def build_run_extras(run: Run, job: Any, repo: Repository, token: str | None) -> dict:
     """Non-secret workflow-input fields about the source, patch push and authenticated
     testing, plus the ``secrets`` reference when the run holds any secret.
@@ -108,7 +130,7 @@ async def build_run_extras(run: Run, job: Any, repo: Repository, token: str | No
     just in time over the internal API. Raises if the record cannot be stored (the
     caller must treat that as a failed start)."""
     extras: dict = {}
-    if repo.source_type == "gitlab" and repo.gitlab_url:
+    if repo.source_type in ("gitlab", "github") and repo.gitlab_url:
         extras["source"] = {"remote_url": repo.gitlab_url, "commit": run.commit_sha or None}
     bundle: dict[str, str] = {}
     if repo.push_patches:
@@ -120,6 +142,7 @@ async def build_run_extras(run: Run, job: Any, repo: Repository, token: str | No
                 "Run %s: push_patches is on but there is nothing to push to (%s); "
                 "patches stay local.", run.id,
                 "uploaded source has no remote" if repo.source_type == "upload"
+                else "pushing to GitHub is not supported yet" if repo.source_type == "github"
                 else "no credential attached",
             )
     cookie = await resolve_job_cookie(job)
@@ -220,9 +243,9 @@ def build_model_overrides(admin: Any, repo: Repository) -> dict:
 
 
 def capture_source_info(run: Run, repo: Repository, repo_dir: str) -> None:
-    """Best-effort: commit SHA of a GitLab checkout + a persistent browse-only file
-    tree (the checkout is deleted after the run, so grab both now)."""
-    if repo.source_type == "gitlab":
+    """Best-effort: commit SHA of a GitLab/GitHub checkout + a persistent browse-only
+    file tree (the checkout is deleted after the run, so grab both now)."""
+    if repo.source_type in ("gitlab", "github"):
         try:
             import subprocess
             out = subprocess.run(

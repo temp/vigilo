@@ -56,7 +56,7 @@ class Credential(Base):
     owner_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id"), nullable=False, index=True
     )
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # gitlab_token | cookie_header
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # gitlab_token | github_app | cookie_header
     label: Mapped[str] = mapped_column(String(200), nullable=False)
     secret_enc: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     gitlab_base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -108,7 +108,7 @@ class Repository(Base):
         ForeignKey("users.id"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    source_type: Mapped[str] = mapped_column(String(16), nullable=False)  # upload | gitlab
+    source_type: Mapped[str] = mapped_column(String(16), nullable=False)  # upload | gitlab | github
     gitlab_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     gitlab_project_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     default_credential_id: Mapped[uuid.UUID | None] = mapped_column(

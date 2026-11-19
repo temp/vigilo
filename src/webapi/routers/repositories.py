@@ -1,4 +1,4 @@
-"""Repositories: attachable sources (upload or GitLab), with per-repo privacy.
+"""Repositories: attachable sources (upload, GitLab or GitHub), with per-repo privacy.
 
 Non-private repos are team-visible; private repos are visible only to the owner,
 explicitly-granted users, and admins (see acl.py). The credential used to fetch a
@@ -42,7 +42,11 @@ from src.webapi.engine.base import ExecutionEngine
 from src.webapi.engine.provider import get_engine
 from urllib.parse import urlparse
 
-from src.webapi.credential_guard import CredentialRejected, validate_gitlab_credential
+from src.webapi.credential_guard import (
+    GIT_SOURCES,
+    CredentialRejected,
+    validate_source_credential,
+)
 from src.webapi.models import (
     ROLE_ADMIN,
     Credential,
@@ -133,6 +137,46 @@ async def _make_gitlab_credential(session, user, label, token, base_url):
     return cred.id
 
 
+async def _make_github_token_credential(session, user, label, token, repo_url):
+    """Encrypt a pasted GitHub personal access token as a per-user ``github_token``
+    credential bound to the repository's GitHub host; return its id."""
+    from src.webapi.credential_guard import GITHUB_TOKEN_KIND
+    from src.webapi.github_app import parse_repo_url
+    from src.webapi.security.vault import build_vault
+    try:
+        web_base = parse_repo_url(repo_url).web_base
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"GitHub: {exc}")
+    cred = Credential(
+        owner_id=user.id, kind=GITHUB_TOKEN_KIND, label=label[:200],
+        secret_enc=build_vault(get_settings()).encrypt(token.strip()),
+        gitlab_base_url=web_base,
+    )
+    session.add(cred)
+    await session.flush()
+    return cred.id
+
+
+async def _make_github_app_credential(session, user, label, app, repo_url):
+    """Encrypt pasted GitHub App settings as a per-user ``github_app`` credential bound
+    to the repository's GitHub host (github.com or the GHE host); return its id."""
+    from src.webapi.github_app import GITHUB_APP_KIND, build_app_secret, parse_repo_url
+    from src.webapi.security.vault import build_vault
+    try:
+        secret = build_app_secret(app.app_id, app.private_key, app.installation_id)
+        web_base = parse_repo_url(repo_url).web_base
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"GitHub App: {exc}")
+    cred = Credential(
+        owner_id=user.id, kind=GITHUB_APP_KIND, label=label[:200],
+        secret_enc=build_vault(get_settings()).encrypt(secret),
+        gitlab_base_url=web_base,
+    )
+    session.add(cred)
+    await session.flush()
+    return cred.id
+
+
 async def _validate_gitlab_bg(repo_id: uuid.UUID) -> None:
     """Background: verify the repo's access token can reach the GitLab repo
     (`git ls-remote`), capture its browse-only file tree, and ALWAYS resolve
@@ -144,28 +188,31 @@ async def _validate_gitlab_bg(repo_id: uuid.UUID) -> None:
     from src.webapi.db import _session_maker
     from src.webapi.ingestion import validate_gitlab_access
     from src.webapi.repo_tree import capture_gitlab_tree
-    from src.webapi.security.vault import build_vault
+    from src.webapi.source_access import clone_username, resolve_clone_token
 
     status_val, err, url, token = "failed", "validation did not run", None, None
     try:
+        cred = None
         async with _session_maker()() as session:
             repo = await session.get(Repository, repo_id)
             if repo is None:
                 return
-            url = repo.gitlab_url
+            url, source_type = repo.gitlab_url, repo.source_type
             if repo.default_credential_id:
                 cred = await session.get(Credential, repo.default_credential_id)
                 if cred is not None:
-                    validate_gitlab_credential(cred, repo.created_by, repo.gitlab_url)
-                token = build_vault(get_settings()).decrypt(cred.secret_enc) if cred else None
+                    validate_source_credential(cred, repo.created_by, source_type, url)
+        user = clone_username(source_type)
         try:
-            await _asyncio.to_thread(validate_gitlab_access, url, token)  # read/access check
+            # GitHub: minting the installation token is itself the first access check.
+            token = await _asyncio.to_thread(resolve_clone_token, cred, source_type, url)
+            await _asyncio.to_thread(validate_gitlab_access, url, token, username=user)
             status_val, err = "ready", None
         except Exception as exc:  # bad token, insufficient scope, host unreachable, …
             status_val, err = "failed", str(exc)[:500]
         if status_val == "ready":  # capture the browse-only tree while access is valid
             try:
-                await _asyncio.to_thread(capture_gitlab_tree, str(repo_id), url, token)
+                await _asyncio.to_thread(capture_gitlab_tree, str(repo_id), url, token, user)
             except Exception as exc:
                 logger.warning("gitlab tree capture for repo %s failed: %s", repo_id, exc)
     except Exception as exc:  # decrypt/DB/etc. — record failed, never leave 'importing'
@@ -197,7 +244,7 @@ async def create_repository(
         if cred is None or cred.owner_id != user.id:
             raise HTTPException(status_code=400, detail="Unknown or non-owned credential")
         try:
-            validate_gitlab_credential(cred, user.id, payload.gitlab_url)
+            validate_source_credential(cred, user.id, payload.source_type, payload.gitlab_url)
         except CredentialRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc))
     if payload.push_patches and payload.source_type != "gitlab":
@@ -210,14 +257,22 @@ async def create_repository(
             session, user, f"{payload.name} GitLab token",
             payload.gitlab_token, payload.gitlab_url,
         )
-    is_gitlab = payload.source_type == "gitlab"
+    if payload.source_type == "github" and payload.github_token:
+        cred_id = await _make_github_token_credential(
+            session, user, f"{payload.name} GitHub token", payload.github_token, payload.gitlab_url,
+        )
+    if payload.source_type == "github" and payload.github_app is not None:
+        cred_id = await _make_github_app_credential(
+            session, user, f"{payload.name} GitHub App", payload.github_app, payload.gitlab_url,
+        )
+    is_gitlab = payload.source_type in GIT_SOURCES
     repo = Repository(
         created_by=user.id, name=payload.name, source_type=payload.source_type,
         gitlab_url=payload.gitlab_url, gitlab_project_id=payload.gitlab_project_id,
         default_credential_id=cred_id,
         is_private=payload.is_private, scan_config=payload.scan_config or {},
         push_patches=payload.push_patches,
-        # GitLab: validate access in the background (importing → ready/failed).
+        # GitLab/GitHub: validate access in the background (importing → ready/failed).
         # Upload: stays idle until source is attached.
         ingestion_status="importing" if is_gitlab else "idle",
     )
@@ -273,21 +328,30 @@ async def repository_tree(
                 src = archive if os.path.isfile(archive) else upload_tree_dir(uploads, str(repo_id))
                 if os.path.exists(src):
                     capture_repo_tree(str(repo_id), src)
-            elif repo.source_type == "gitlab" and repo.gitlab_url:
-                token = None
+            elif repo.source_type in GIT_SOURCES and repo.gitlab_url:
+                import asyncio as _asyncio
+
+                from src.webapi.source_access import clone_username, resolve_clone_token
+                cred = None
                 if repo.default_credential_id:
-                    from src.webapi.security.vault import build_vault
                     cred = await session.get(Credential, repo.default_credential_id)
                     if cred is not None:
-                        validate_gitlab_credential(cred, repo.created_by, repo.gitlab_url)
-                    token = build_vault(get_settings()).decrypt(cred.secret_enc) if cred else None
-                capture_gitlab_tree(str(repo_id), repo.gitlab_url, token)
+                        validate_source_credential(
+                            cred, repo.created_by, repo.source_type, repo.gitlab_url)
+                token = await _asyncio.to_thread(
+                    resolve_clone_token, cred, repo.source_type, repo.gitlab_url)
+                await _asyncio.to_thread(
+                    capture_gitlab_tree, str(repo_id), repo.gitlab_url, token,
+                    clone_username(repo.source_type))
         except Exception as exc:
             logger.warning("tree backfill failed for repo %s: %s", repo_id, exc)
         tree = read_repo_tree(str(repo_id))
     if tree is None:
         msg = ("Couldn't read the repository source — check the GitLab URL/token is valid "
                "and the host is reachable." if repo.source_type == "gitlab"
+               else "Couldn't read the repository source — check the GitHub URL, that the "
+               "GitHub App is installed on it, and that the host is reachable."
+               if repo.source_type == "github"
                else "No source uploaded yet.")
         return {"available": False, "paths": [], "truncated": False, "count": 0, "message": msg}
     return {"available": True, **tree}
@@ -311,9 +375,10 @@ async def update_repository(
         if new_cred_id is not None:
             cred = await session.get(Credential, new_cred_id)
             try:
-                # Must belong to the repository's owner (never to a third user), be a
-                # GitLab token, and be bound to this repository's host.
-                validate_gitlab_credential(cred, repo.created_by, repo.gitlab_url)
+                # Must belong to the repository's owner (never to a third user), be the
+                # source's credential kind, and be bound to this repository's host.
+                validate_source_credential(cred, repo.created_by, repo.source_type,
+                                           repo.gitlab_url)
             except CredentialRejected as exc:
                 raise HTTPException(status_code=400, detail=f"Unknown or non-owned credential: {exc}")
         repo.default_credential_id = new_cred_id
@@ -323,6 +388,25 @@ async def update_repository(
             raise HTTPException(status_code=400, detail="Token only applies to GitLab repos")
         repo.default_credential_id = await _make_gitlab_credential(
             session, user, f"{repo.name} GitLab token", data["gitlab_token"], repo.gitlab_url,
+        )
+        repo.ingestion_status = "importing"
+        repo.ingestion_error = None
+        revalidate = True
+    # A pasted GitHub token or GitHub App replaces the linked credential, likewise.
+    if data.get("github_token"):
+        if repo.source_type != "github":
+            raise HTTPException(status_code=400, detail="A GitHub token only applies to GitHub repos")
+        repo.default_credential_id = await _make_github_token_credential(
+            session, user, f"{repo.name} GitHub token", data["github_token"], repo.gitlab_url,
+        )
+        repo.ingestion_status = "importing"
+        repo.ingestion_error = None
+        revalidate = True
+    if data.get("github_app"):
+        if repo.source_type != "github":
+            raise HTTPException(status_code=400, detail="A GitHub App only applies to GitHub repos")
+        repo.default_credential_id = await _make_github_app_credential(
+            session, user, f"{repo.name} GitHub App", payload.github_app, repo.gitlab_url,
         )
         repo.ingestion_status = "importing"
         repo.ingestion_error = None
@@ -490,6 +574,9 @@ async def issue_webhook(
     session: AsyncSession = Depends(get_async_session),
 ) -> dict[str, str]:
     repo = await _require_owner_or_admin(session, user, repo_id)
+    if repo.source_type == "github":
+        raise HTTPException(status_code=400,
+                            detail="Webhooks are not supported for GitHub repositories yet")
     repo.webhook_secret = secrets.token_urlsafe(32)
     await session.commit()
     return {

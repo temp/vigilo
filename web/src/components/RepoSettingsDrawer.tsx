@@ -60,7 +60,11 @@ export function RepoSettingsDrawer({
         push_patches: pushPatches,
         pipeline_config: clean(cfg),
         scan_config: clean(scan),
-        ...(gitlabToken ? { gitlab_token: gitlabToken } : {}),
+        ...(gitlabToken
+          ? repo.source_type === "github"
+            ? { github_token: gitlabToken }
+            : { gitlab_token: gitlabToken }
+          : {}),
       });
       setGitlabToken("");
       setMsg(gitlabToken ? "Saved — verifying token…" : "Saved");
@@ -138,6 +142,30 @@ export function RepoSettingsDrawer({
               ))}
               {grants.length === 0 && <div className="px-3 py-2 text-sm text-slate">No grants yet.</div>}
             </div>
+          </section>
+        )}
+
+        {repo.source_type === "github" && (
+          <section className="mb-6">
+            <label htmlFor="gh-token" className="mb-1 block text-sm text-slate">
+              Personal access token {repo.ingestion_status === "ready" ? "(set — paste to replace)" : ""}
+            </label>
+            <input
+              id="gh-token"
+              className="field"
+              type="password"
+              autoComplete="off"
+              placeholder="ghp_… / github_pat_…"
+              value={gitlabToken}
+              onChange={(e) => setGitlabToken(e.target.value)}
+            />
+            <p className="mt-1 text-xs text-slate">
+              Used to <b>clone</b> this repository. Stored encrypted. Saving verifies access
+              against the host and resolves to a clear valid/invalid state.
+              {repo.ingestion_status === "failed" && repo.ingestion_error
+                ? ` Last check failed: ${repo.ingestion_error}`
+                : ""}
+            </p>
           </section>
         )}
 

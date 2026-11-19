@@ -45,27 +45,17 @@ class DockerTemporalEngine:
     durable = True
 
     async def _resolve_token(self, credential_id, repo) -> str | None:
-        """Decrypt the repository owner's GitLab token. Re-checks owner, kind and host
-        binding right before decrypting; a failing check aborts the run start."""
-        from src.webapi.db import _session_maker
-        from src.webapi.credential_guard import CredentialRejected, validate_gitlab_credential
-        from src.webapi.models import Credential
-        from src.webapi.security.vault import build_vault
-
-        async with _session_maker()() as session:
-            cred = await session.get(Credential, credential_id)
-            if cred is None:
-                return None
-            try:
-                validate_gitlab_credential(cred, repo.created_by, repo.gitlab_url)
-            except CredentialRejected as exc:
-                raise RuntimeError(f"Repository credential refused: {exc}") from exc
-            return build_vault(get_settings()).decrypt(cred.secret_enc)
+        """Clone secret for the repository (GitLab token / GitHub App installation
+        token); see :func:`src.webapi.engine.common.resolve_repo_token`."""
+        from src.webapi.engine.common import resolve_repo_token
+        return await resolve_repo_token(credential_id, repo)
 
     async def start(self, run: Run, job: Job, repo: Repository) -> None:
         import docker  # lazy
 
         from src.webapi.ingestion import prepare_repo
+
+        from src.webapi.source_access import clone_username
 
         settings = get_settings()
         repo_dir = os.path.join(run.data_dir, "repo")
@@ -78,7 +68,7 @@ class DockerTemporalEngine:
         # Materialize the source into repo_dir (extract upload / clone GitLab).
         token = None
         upload_path = None
-        if repo.source_type == "gitlab" and repo.default_credential_id:
+        if repo.source_type in ("gitlab", "github") and repo.default_credential_id:
             token = await self._resolve_token(repo.default_credential_id, repo)
         if repo.source_type == "upload":
             from src.webapi.ingestion import upload_archive_path, upload_tree_dir
@@ -89,6 +79,7 @@ class DockerTemporalEngine:
         prepare_repo(
             source_type=repo.source_type, repo_dir=repo_dir,
             upload_path=upload_path, gitlab_url=repo.gitlab_url, token=token,
+            username=clone_username(repo.source_type),
         )
 
         # Commit SHA + persistent browse-only file tree (best-effort).

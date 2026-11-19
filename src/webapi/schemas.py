@@ -48,6 +48,28 @@ class CredentialCreate(BaseModel):
     secret: str
     gitlab_base_url: str | None = None
 
+    @model_validator(mode="after")
+    def _github_app_secret(self):
+        # A github_app secret is a JSON object {app_id, private_key, installation_id?};
+        # reject unusable ones here instead of at the first run.
+        if self.kind == "github_app":
+            from src.webapi.github_app import parse_app_secret
+            parse_app_secret(self.secret)
+            if self.gitlab_base_url:
+                from urllib.parse import urlparse
+                if (urlparse(self.gitlab_base_url).scheme or "").lower() != "https":
+                    raise ValueError("a GitHub base URL must use https://")
+        return self
+
+
+class GitHubAppIn(BaseModel):
+    """GitHub App settings pasted when adding/updating a GitHub repository. Stored
+    encrypted as a ``github_app`` credential owned by the user (never returned)."""
+    app_id: str
+    private_key: str
+    # Optional: found through the repository when left empty.
+    installation_id: str | None = None
+
 
 class CredentialRead(BaseModel):
     id: uuid.UUID
@@ -135,7 +157,7 @@ _SCAN_KEYS = {"description", "focus", "avoid"}
 
 class RepositoryCreate(BaseModel):
     name: str
-    source_type: Literal["upload", "gitlab"]
+    source_type: Literal["upload", "gitlab", "github"]
     gitlab_url: str | None = None
     gitlab_project_id: str | None = None
     default_credential_id: uuid.UUID | None = None
@@ -146,10 +168,28 @@ class RepositoryCreate(BaseModel):
     # default_credential_id (never stored in the clear). Use a write-scoped token
     # if you also enable push_patches.
     gitlab_token: str | None = None
+    # GitHub (github.com or GitHub Enterprise Server); ``gitlab_url`` carries the
+    # GitHub repository URL. Clone with a personal access token (``github_token``,
+    # read access to contents is enough) or a GitHub App (``github_app``), or link an
+    # existing github_token/github_app credential through ``default_credential_id``.
+    github_token: str | None = None
+    github_app: GitHubAppIn | None = None
     push_patches: bool = False
 
     @model_validator(mode="after")
     def _gitlab_needs_url(self):
+        if self.source_type == "github":
+            if not self.gitlab_url:
+                raise ValueError("gitlab_url (the GitHub repository URL) is required "
+                                 "when source_type='github'")
+            from src.webapi.github_app import parse_repo_url
+            parse_repo_url(self.gitlab_url)  # https, no credentials, /<owner>/<repo>
+            if self.gitlab_token:
+                raise ValueError("gitlab_token is for GitLab sources; use github_token")
+            if self.github_token and self.github_app is not None:
+                raise ValueError("give either github_token or github_app, not both")
+        elif self.github_app is not None or self.github_token:
+            raise ValueError("github_token/github_app are only valid when source_type='github'")
         if self.source_type == "gitlab":
             if not self.gitlab_url:
                 raise ValueError("gitlab_url is required when source_type='gitlab'")
@@ -213,6 +253,9 @@ class RepositoryUpdate(BaseModel):
     scan_config: dict | None = None
     # Add/replace the GitLab access token (encrypted as a new credential + linked).
     gitlab_token: str | None = None
+    # Add/replace the GitHub token or App of a GitHub repository (new credential + linked).
+    github_token: str | None = None
+    github_app: GitHubAppIn | None = None
 
     @field_validator("pipeline_config")
     @classmethod

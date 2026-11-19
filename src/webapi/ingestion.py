@@ -3,8 +3,8 @@
 Two sources:
 - **upload** — extract a user-provided archive (zip / tar.gz), with path-traversal
   guards (uploads are semi-trusted but we never trust archive member names).
-- **gitlab** — shallow ``git clone`` over HTTPS with the owner's token injected into
-  the URL. The token is NEVER left on disk or in logs (``origin`` is reset to the clean URL): the ``.vigilo-remote-url``
+- **gitlab** / **github** — shallow ``git clone`` over HTTPS with the owner's token
+  (GitLab access token, or a GitHub App installation token) injected into the URL. The token is NEVER left on disk or in logs (``origin`` is reset to the clean URL): the ``.vigilo-remote-url``
   marker records the CLEAN url (no credentials), and clone errors are scrubbed.
 """
 from __future__ import annotations
@@ -180,8 +180,9 @@ def reject_embedded_credentials(url: str) -> None:
         )
 
 
-def build_clone_url(gitlab_url: str, token: str) -> str:
-    """Return an HTTP(S) clone URL with the token injected as oauth2 basic auth.
+def build_clone_url(gitlab_url: str, token: str, username: str = "oauth2") -> str:
+    """Return an HTTP(S) clone URL with the token injected as basic auth
+    (``oauth2`` for GitLab, ``x-access-token`` for GitHub).
     Rejects non-web schemes (file://, ext::, ssh://, …) and URLs with embedded
     credentials."""
     scheme = _require_web_scheme(gitlab_url)
@@ -191,17 +192,18 @@ def build_clone_url(gitlab_url: str, token: str) -> str:
     reject_embedded_credentials(gitlab_url)
     p = urlparse(gitlab_url)
     host = p.hostname or ""
-    netloc = f"oauth2:{token}@{host}"
+    netloc = f"{username}:{token}@{host}"
     if p.port:
         netloc += f":{p.port}"
     return urlunparse((scheme, netloc, p.path, "", "", ""))
 
 
-def validate_gitlab_access(gitlab_url: str, token: str | None, runner=subprocess.run) -> int:
-    """Verify a GitLab repo is reachable + the token grants access, WITHOUT a full
-    clone, via ``git ls-remote``. Returns the number of refs. Raises RuntimeError on
-    failure (token scrubbed from the message)."""
-    clone_url = build_clone_url(gitlab_url, token or "")
+def validate_gitlab_access(gitlab_url: str, token: str | None, runner=subprocess.run,
+                           username: str = "oauth2") -> int:
+    """Verify a GitLab/GitHub repo is reachable + the token grants access, WITHOUT a
+    full clone, via ``git ls-remote``. Returns the number of refs. Raises RuntimeError
+    on failure (token scrubbed from the message)."""
+    clone_url = build_clone_url(gitlab_url, token or "", username)
     result = runner(
         ["git", "ls-remote", "--heads", clone_url],
         capture_output=True, text=True, timeout=45,
@@ -267,8 +269,10 @@ def prepare_repo(
     upload_path: str | None = None,
     gitlab_url: str | None = None,
     token: str | None = None,
+    username: str = "oauth2",
 ) -> str:
-    """Populate ``repo_dir`` from the given source. Returns the repo dir."""
+    """Populate ``repo_dir`` from the given source. Returns the repo dir.
+    ``gitlab_url`` is the repository URL for both git sources (gitlab, github)."""
     os.makedirs(repo_dir, exist_ok=True)
     if source_type == "upload":
         # upload_path may be an archive file OR a directory (uncompressed upload).
@@ -278,10 +282,10 @@ def prepare_repo(
             copy_tree(upload_path, repo_dir)
         else:
             extract_archive(upload_path, repo_dir)
-    elif source_type == "gitlab":
+    elif source_type in ("gitlab", "github"):
         if not gitlab_url:
-            raise ValueError("gitlab source requires gitlab_url")
-        clone_url = build_clone_url(gitlab_url, token or "")
+            raise ValueError(f"{source_type} source requires a repository URL")
+        clone_url = build_clone_url(gitlab_url, token or "", username)
         clone_repo(clone_url, repo_dir)
         try:
             scrub_origin_credentials(repo_dir, gitlab_url)
